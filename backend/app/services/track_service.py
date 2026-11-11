@@ -16,8 +16,16 @@ class TrackService:
         self._track_cache: Dict[int, TrackData] = {}
 
     def get_track_for_map(self, circuit_key: int) -> Optional[TrackData]:
-        """캐시된 트랙 데이터 반환"""
-        return self._track_cache.get(circuit_key)
+        """캐시된 트랙 데이터 반환 - 정확한 키 없으면 첫 번째 캐시 반환"""
+        if circuit_key in self._track_cache:
+            return self._track_cache[circuit_key]
+        # 정확한 키가 없으면 첫 번째 캐시된 트랙 반환 (개발용)
+        if self._track_cache:
+            return next(iter(self._track_cache.values()))
+        # circuit_key가 0인 경우도 첫 번째 캐시 반환
+        if 0 in self._track_cache:
+            return self._track_cache[0]
+        return None
 
     def cache_track(self, track_data: TrackData):
         """트랙 데이터 캐싱"""
@@ -50,9 +58,19 @@ class TrackService:
             canvas_y = padding + (1 - norm_y) * (height - 2 * padding)  # Y축 뒤집기
             return (canvas_x, canvas_y)
 
+        # 트랙 닫기: 첫 점을 끝에 추가 (closed loop)
+        centerline = track_data.centerline[:]
+        if centerline and len(centerline) > 2:
+            first = centerline[0]
+            last = centerline[-1]
+            # 첫/끝 점이 이미 가까우면 생략, 아니면 닫기
+            dist = ((first[0] - last[0]) ** 2 + (first[1] - last[1]) ** 2) ** 0.5
+            if dist > 1.0:
+                centerline.append(first)
+
         centerline_canvas = [
-            transform(x, y) for x, y in track_data.centerline
-        ] if track_data.centerline else []
+            transform(x, y) for x, y in centerline
+        ] if centerline else []
 
         corners_canvas = []
         for corner in track_data.corners:

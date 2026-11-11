@@ -21,6 +21,13 @@ class SessionType(str, Enum):
     SPRINT = "SPRINT"
     RACE = "RACE"
 
+# 세션 타입 매핑 (FastF1 스타일 별칭)
+SESSION_TYPE_ALIASES = {
+    "R": "RACE",
+    "Q": "QUALIFYING",
+    "S": "SPRINT",
+}
+
 
 class DriverTelemetry(BaseModel):
     """실시간 드라이버 텔레메트리"""

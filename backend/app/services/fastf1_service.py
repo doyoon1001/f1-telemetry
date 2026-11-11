@@ -6,12 +6,131 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import os
+import httpx
 
 from app.models.telemetry import (
     SessionInfo, TrackData, LapData, TyreCompound,
-    SessionType
+    SessionType, SESSION_TYPE_ALIASES
 )
 from app.core.config import get_settings
+
+
+# GP별 circuit_key 매핑 (OpenF1 기준 - MultiViewer API용)
+CIRCUIT_KEY_MAP = {
+    'bahrain': 63, 'saudi_arabia': 149, 'australia': 10, 'japan': 46, 'china': 49,
+    'miami': 151, 'emilia_romagna': 6, 'monaco': 22, 'canada': 23, 'spain': 15,
+    'austria': 19, 'great_britain': 2, 'hungary': 4, 'belgium': 7, 'netherlands': 55,
+    'italy': 39, 'azerbaijan': 144, 'singapore': 61, 'united_states': 9, 'mexico': 65,
+    'brazil': 14, 'las_vegas': 152, 'qatar': 150, 'abu_dhabi': 70,
+    'monza': 39,  # alias
+}
+
+# FastF1 circuit_key 매핑 (별도)
+FASTF1_CIRCUIT_KEY_MAP = {
+    'bahrain': 1, 'saudi_arabia': 2, 'australia': 3, 'japan': 4, 'china': 5,
+    'miami': 6, 'emilia_romagna': 7, 'monaco': 8, 'canada': 9, 'spain': 10,
+    'austria': 11, 'great_britain': 12, 'hungary': 13, 'belgium': 14, 'netherlands': 15,
+    'italy': 16, 'azerbaijan': 17, 'singapore': 18, 'united_states': 19, 'mexico': 20,
+    'brazil': 21, 'las_vegas': 22, 'qatar': 23, 'abu_dhabi': 24,
+    'monza': 16,
+}
+
+
+# 모나코 서킷 폴백 데이터 (API 실패 시)
+MONACO_FALLBACK_CORNERS = [
+    {'number': 1, 'letter': None, 'x': 0.0, 'y': 0.0, 'angle': 90.0},
+    {'number': 2, 'letter': None, 'x': 50.0, 'y': -200.0, 'angle': -45.0},
+    {'number': 3, 'letter': None, 'x': 300.0, 'y': -150.0, 'angle': -90.0},
+    {'number': 4, 'letter': None, 'x': 400.0, 'y': 100.0, 'angle': 180.0},
+    {'number': 5, 'letter': None, 'x': 200.0, 'y': 300.0, 'angle': 90.0},
+    {'number': 6, 'letter': None, 'x': -100.0, 'y': 400.0, 'angle': -90.0},
+    {'number': 7, 'letter': None, 'x': -300.0, 'y': 200.0, 'angle': 180.0},
+    {'number': 8, 'letter': None, 'x': -400.0, 'y': -100.0, 'angle': -90.0},
+    {'number': 9, 'letter': None, 'x': -200.0, 'y': -300.0, 'angle': 90.0},
+    {'number': 10, 'letter': None, 'x': 0.0, 'y': -100.0, 'angle': 0.0},
+    {'number': 11, 'letter': None, 'x': 150.0, 'y': -50.0, 'angle': -45.0},
+    {'number': 12, 'letter': None, 'x': 200.0, 'y': 100.0, 'angle': 90.0},
+    {'number': 13, 'letter': None, 'x': 100.0, 'y': 200.0, 'angle': 180.0},
+    {'number': 14, 'letter': None, 'x': -50.0, 'y': 150.0, 'angle': -90.0},
+    {'number': 15, 'letter': None, 'x': -150.0, 'y': 50.0, 'angle': 0.0},
+    {'number': 16, 'letter': None, 'x': -100.0, 'y': -50.0, 'angle': 90.0},
+    {'number': 17, 'letter': None, 'x': 0.0, 'y': -100.0, 'angle': 180.0},
+    {'number': 18, 'letter': None, 'x': 50.0, 'y': 0.0, 'angle': -90.0},
+    {'number': 19, 'letter': None, 'x': 100.0, 'y': -100.0, 'angle': 0.0},
+]
+
+FALLBACK_TRACKS = {
+    'monaco': {
+        'name': 'Monaco',
+        'circuit_short_name': 'Monaco',
+        'country_code': 'MCO',
+        'country_name': 'Monaco',
+        'location': 'Monaco',
+        'corners': MONACO_FALLBACK_CORNERS,
+    },
+    'bahrain': {
+        'name': 'Bahrain',
+        'circuit_short_name': 'Bahrain',
+        'country_code': 'BHR',
+        'country_name': 'Bahrain',
+        'location': 'Sakhir',
+        'corners': [
+            {'number': i, 'letter': None, 'x': 500*np.cos(2*np.pi*i/15), 'y': 500*np.sin(2*np.pi*i/15), 'angle': 45.0}
+            for i in range(15)
+        ],
+    },
+    'silverstone': {
+        'name': 'Great Britain',
+        'circuit_short_name': 'Silverstone',
+        'country_code': 'GBR',
+        'country_name': 'United Kingdom',
+        'location': 'Silverstone',
+        'corners': [
+            {'number': i, 'letter': None, 'x': 600*np.cos(2*np.pi*i/18), 'y': 600*np.sin(2*np.pi*i/18), 'angle': 45.0}
+            for i in range(18)
+        ],
+    },
+    'italy': {
+        'name': 'Monza',
+        'circuit_short_name': 'Monza',
+        'country_code': 'ITA',
+        'country_name': 'Italy',
+        'location': 'Monza',
+        'corners': [
+            {'number': 1, 'letter': None, 'x': 0.0, 'y': 0.0, 'angle': -90.0},
+            {'number': 2, 'letter': None, 'x': 50.0, 'y': 50.0, 'angle': 90.0},
+            {'number': 3, 'letter': None, 'x': 300.0, 'y': -100.0, 'angle': -120.0},
+            {'number': 4, 'letter': None, 'x': 500.0, 'y': -200.0, 'angle': 110.0},
+            {'number': 5, 'letter': None, 'x': 550.0, 'y': -150.0, 'angle': -90.0},
+            {'number': 6, 'letter': None, 'x': 600.0, 'y': 100.0, 'angle': -100.0},
+            {'number': 7, 'letter': None, 'x': 650.0, 'y': 250.0, 'angle': -80.0},
+            {'number': 8, 'letter': None, 'x': 500.0, 'y': 400.0, 'angle': 120.0},
+            {'number': 9, 'letter': None, 'x': 450.0, 'y': 350.0, 'angle': -90.0},
+            {'number': 10, 'letter': None, 'x': 400.0, 'y': 400.0, 'angle': 100.0},
+            {'number': 11, 'letter': None, 'x': 200.0, 'y': 300.0, 'angle': -150.0},
+        ],
+    },
+    'monza': {
+        'name': 'Monza',
+        'circuit_short_name': 'Monza',
+        'country_code': 'ITA',
+        'country_name': 'Italy',
+        'location': 'Monza',
+        'corners': [
+            {'number': 1, 'letter': None, 'x': 0.0, 'y': 0.0, 'angle': -90.0},
+            {'number': 2, 'letter': None, 'x': 50.0, 'y': 50.0, 'angle': 90.0},
+            {'number': 3, 'letter': None, 'x': 300.0, 'y': -100.0, 'angle': -120.0},
+            {'number': 4, 'letter': None, 'x': 500.0, 'y': -200.0, 'angle': 110.0},
+            {'number': 5, 'letter': None, 'x': 550.0, 'y': -150.0, 'angle': -90.0},
+            {'number': 6, 'letter': None, 'x': 600.0, 'y': 100.0, 'angle': -100.0},
+            {'number': 7, 'letter': None, 'x': 650.0, 'y': 250.0, 'angle': -80.0},
+            {'number': 8, 'letter': None, 'x': 500.0, 'y': 400.0, 'angle': 120.0},
+            {'number': 9, 'letter': None, 'x': 450.0, 'y': 350.0, 'angle': -90.0},
+            {'number': 10, 'letter': None, 'x': 400.0, 'y': 400.0, 'angle': 100.0},
+            {'number': 11, 'letter': None, 'x': 200.0, 'y': 300.0, 'angle': -150.0},
+        ],
+    },
+}
 
 
 class FastF1Service:
@@ -30,47 +149,178 @@ class FastF1Service:
 
     def get_session(self, year: int, gp: str, session_type: str) -> SessionInfo:
         """세션 로드 및 정보 반환"""
-        session = fastf1.get_session(year, gp, session_type)
+        # 세션 타입 별칭 매핑 (R -> RACE 등)
+        normalized_session_type = SESSION_TYPE_ALIASES.get(session_type.upper(), session_type)
+
+        session = fastf1.get_session(year, gp, normalized_session_type)
         session.load()
 
         self._session = session
 
+        # FastF1 3.9+ API에서 사용 가능한 필드 매핑
+        event = session.event
+        circuit_name = getattr(event, 'Location', getattr(event, 'Country', gp))
+        country_code = getattr(event, 'Country', '')
+        
+        # circuit_key 매핑
+        gp_lower = gp.lower().replace(' ', '_')
+        circuit_key = CIRCUIT_KEY_MAP.get(gp_lower, 0)
+
         return SessionInfo(
-            session_key=session.session_key,
-            meeting_key=session.meeting_key,
-            circuit_key=session.circuit_key,
-            session_type=SessionType(session.session_type),
+            session_key=id(session),  # 대체값
+            meeting_key=0,  # 대체값
+            circuit_key=circuit_key,  # 실제 circuit_key 사용
+            session_type=SessionType(normalized_session_type),
             session_name=session.name,
-            date_start=session.date_start,
-            date_end=session.date_end,
-            year=session.event.year,
-            circuit_short_name=session.event.CircuitShortName,
-            country_code=session.event.CountryCode
+            date_start=session.date,
+            date_end=None,
+            year=int(event.get('year', year)),
+            circuit_short_name=circuit_name,
+            country_code=country_code
         )
 
+    def _get_fallback_track_data(self, gp: str) -> Dict[str, Any]:
+        """폴백 트랙 데이터 반환 (API 실패 시)"""
+        gp_lower = gp.lower().replace(' ', '_')
+        return FALLBACK_TRACKS.get(gp_lower, FALLBACK_TRACKS['monaco'])
+
+    def _get_track_from_multiviewer(self, circuit_key: int, year: int) -> Optional[Dict[str, Any]]:
+        """MultiViewer API에서 실제 트랙 데이터 가져오기"""
+        try:
+            url = f"https://api.multiviewer.app/api/v1/circuits/{circuit_key}/{year}"
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            resp = httpx.get(url, headers=headers, timeout=10.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                # 중심선 좌표 (x, y 리스트)
+                centerline = list(zip(data.get('x', []), data.get('y', [])))
+                # 코너 정보
+                corners = []
+                for c in data.get('corners', []):
+                    pos = c.get('trackPosition', {})
+                    corners.append({
+                        'number': c.get('number'),
+                        'letter': None,
+                        'x': float(pos.get('x', 0)),
+                        'y': float(pos.get('y', 0)),
+                        'angle': float(c.get('angle', 0))
+                    })
+                return {
+                    'centerline': [[float(x), float(y)] for x, y in centerline],
+                    'corners': corners,
+                    'rotation': data.get('rotation', 0)
+                }
+        except Exception as e:
+            print(f"MultiViewer API error: {e}")
+        return None
+
     def get_track_data(self) -> TrackData:
-        """트랙 데이터 추출 (중심선, 코너, 바운더리)"""
+        """트랙 데이터 추출 (중심선, 코너, 바운더리) - MultiViewer API 우선 사용"""
         if not self._session:
             raise ValueError("세션이 로드되지 않음. get_session()을 먼저 호출하세요.")
 
-        circuit_info = self._session.get_circuit_info()
+        event = self._session.event
+        gp_name = getattr(event, 'Location', getattr(event, 'Country', 'Unknown'))
+        year = int(getattr(event, 'year', 2024))
 
-        # 중심선 좌표
-        centerline = []
-        if hasattr(circuit_info, 'corners') and len(circuit_info.corners) > 0:
-            # FastF1에서 제공하는 회전 정보로 대략적인 트랙 형태 구성
-            pass
+        gp_lower = gp_name.lower().replace(' ', '_')
 
-        # 더 정확한 트랙 데이터는 OpenF1 REST API에서 가져오는 것이 좋음
-        # 여기서는 기본 구조만 반환
+        # MultiViewer용 circuit_key (OpenF1 기준)
+        mv_circuit_key = CIRCUIT_KEY_MAP.get(gp_lower, 0)
+        # FastF1용 circuit_key
+        ff_circuit_key = FASTF1_CIRCUIT_KEY_MAP.get(gp_lower, 0)
+
+        circuit_name = getattr(event, 'Location', getattr(event, 'Country', gp_name))
+        country_code = getattr(event, 'Country', '')
+
+        # 1순위: MultiViewer API로 실제 트랙 데이터 가져오기
+        track_data = None
+        if mv_circuit_key:
+            track_data = self._get_track_from_multiviewer(mv_circuit_key, year)
+
+        # 2순위: FastF1 circuit_info
+        if not track_data:
+            try:
+                circuit_info = self._session.get_circuit_info()
+                if hasattr(circuit_info, 'corners') and len(circuit_info.corners) > 0:
+                    corners = []
+                    track_path = []
+                    for _, corner in circuit_info.corners.iterrows():
+                        c = {
+                            'number': int(corner.Number) if not pd.isna(corner.Number) else None,
+                            'letter': corner.Letter if not pd.isna(corner.Letter) else None,
+                            'x': float(corner.X) if not pd.isna(corner.X) else None,
+                            'y': float(corner.Y) if not pd.isna(corner.Y) else None,
+                            'angle': float(corner.Angle) if not pd.isna(corner.Angle) else None
+                        }
+                        corners.append(c)
+                        if c['x'] is not None and c['y'] is not None:
+                            track_path.append([c['x'], c['y']])
+                    if corners:
+                        track_data = {
+                            'centerline': track_path,
+                            'corners': corners,
+                            'rotation': 0
+                        }
+            except Exception:
+                pass
+
+        # 3순위: 폴백 데이터
+        if not track_data:
+            fallback = self._get_fallback_track_data(gp_name)
+            corners = fallback['corners']
+            track_path = [[c['x'], c['y']] for c in corners if c['x'] is not None and c['y'] is not None]
+            track_data = {
+                'centerline': track_path,
+                'corners': corners,
+                'rotation': 0
+            }
+
+        # TrackData 객체 생성
+        final_circuit_key = mv_circuit_key if mv_circuit_key else ff_circuit_key
+
+        if track_data and track_data.get('centerline'):
+            # 회전 적용 (MultiViewer rotation 값 사용)
+            rotation = track_data.get('rotation', 0)
+            centerline = track_data['centerline']
+            corners = track_data['corners']
+
+            # rotation이 0이 아니면 좌표 회전 (라디안)
+            if rotation:
+                import math
+                rad = math.radians(rotation)
+                cos_r, sin_r = math.cos(rad), math.sin(rad)
+                centerline = [[x * cos_r - y * sin_r, x * sin_r + y * cos_r] for x, y in centerline]
+                for c in corners:
+                    if c['x'] is not None and c['y'] is not None:
+                        x, y = c['x'], c['y']
+                        c['x'] = x * cos_r - y * sin_r
+                        c['y'] = x * sin_r + y * cos_r
+
+            return TrackData(
+                circuit_key=final_circuit_key,
+                circuit_short_name=circuit_name,
+                country_code=country_code,
+                country_name=country_code,
+                location=circuit_name,
+                centerline=centerline,
+                corners=corners,
+                boundaries=[]
+            )
+
+        # 최후 폴백
+        fallback = self._get_fallback_track_data(gp_name)
+        corners = fallback['corners']
+        track_path = [[c['x'], c['y']] for c in corners if c['x'] is not None and c['y'] is not None]
+
         return TrackData(
-            circuit_key=self._session.circuit_key,
-            circuit_short_name=self._session.event.CircuitShortName,
-            country_code=self._session.event.CountryCode,
-            country_name=self._session.event.CountryName,
-            location=self._session.event.Location,
-            centerline=[],
-            corners=[],
+            circuit_key=final_circuit_key,
+            circuit_short_name=circuit_name,
+            country_code=country_code,
+            country_name=fallback.get('country_name', country_code),
+            location=fallback.get('location', circuit_name),
+            centerline=track_path,
+            corners=corners,
             boundaries=[]
         )
 
@@ -165,11 +415,22 @@ class FastF1Service:
         if not self._session:
             raise ValueError("세션이 로드되지 않음.")
 
-        circuit_info = self._session.get_circuit_info()
+        event = self._session.event
+        gp_name = getattr(event, 'Location', getattr(event, 'Country', 'Unknown'))
+        fallback = self._get_fallback_track_data(gp_name)
+
+        # FastF1 회로 정보 시도
+        try:
+            circuit_info = self._session.get_circuit_info()
+            has_circuit_info = True
+        except Exception:
+            has_circuit_info = False
+
+        circuit_name = getattr(event, 'Location', getattr(event, 'Country', gp_name))
 
         # 코너 정보 추출
         corners = []
-        if hasattr(circuit_info, 'corners'):
+        if has_circuit_info and hasattr(circuit_info, 'corners'):
             for _, corner in circuit_info.corners.iterrows():
                 corners.append({
                     'number': int(corner.Number) if not pd.isna(corner.Number) else None,
@@ -179,8 +440,11 @@ class FastF1Service:
                     'angle': float(corner.Angle) if not pd.isna(corner.Angle) else None
                 })
 
+        # FastF1 데이터가 없으면 폴백 사용
+        if not corners:
+            corners = fallback['corners']
+
         # 회전 경로 (트랙 중심선 근사)
-        # FastF1에서 정확한 중심선을 얻기 어려우므로 코너 점들을 연결
         track_path = []
         if corners:
             for c in corners:
@@ -188,7 +452,7 @@ class FastF1Service:
                     track_path.append([c['x'], c['y']])
 
         return {
-            'circuit_name': self._session.event.CircuitShortName,
+            'circuit_name': circuit_name,
             'corners': corners,
             'track_path': track_path,
             'bounds': self._calculate_bounds(corners)
